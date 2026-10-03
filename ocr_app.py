@@ -20,9 +20,12 @@ GNU Affero General Public License for more details.
 
 실행:  python ocr_app.py
 """
+import io
 import json
+import math
 import os
 import queue
+import statistics
 import threading
 import time
 import tkinter as tk
@@ -31,8 +34,9 @@ from concurrent.futures import ThreadPoolExecutor
 from tkinter import filedialog, messagebox, ttk
 
 import pymupdf
+from PIL import Image, ImageChops
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 APP_TITLE = f"PDF OCR (구글 Vision) v{VERSION}"
 SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".pdf_ocr_app.json")
 
@@ -42,6 +46,10 @@ USD_PER_1000_PAGES = 1.5
 # 단어 뒤에 붙는 구분자 종류
 SPACE_BREAKS = {"SPACE", "SURE_SPACE", "EOL_SURE_SPACE"}
 LINE_BREAKS = {"EOL_SURE_SPACE", "LINE_BREAK"}
+
+# 이 범위의 기울기만 보정한다 (너무 작으면 의미 없고, 너무 크면 세로쓰기 등 오판 가능)
+MIN_SKEW_DEGREES = 0.2
+MAX_SKEW_DEGREES = 10
 
 LINKS = {
     "console": "https://console.cloud.google.com/",
@@ -158,6 +166,8 @@ HELP_TEXT = """\
    · OCR 페이지 범위: 비우면 전체. 예) 1-5 (처음엔 몇 쪽만 시험해 보세요), 1-10, 15
    · 분할 시작 페이지: 예) 327 → 1~326쪽 / 327쪽~끝 두 파일로 나눔. 여러 개는 쉼표.
    · 이미 글자가 있는 페이지 건너뛰기: 원래 글자가 들어 있는 페이지는 OCR하지 않음 (비용 절약)
+   · 기울기 보정: 비뚤게 스캔된 페이지를 똑바로 세워서 저장 (추가 요금 없음)
+     이미 OCR한 PDF도 이 옵션을 켜고 다시 [OCR 시작]하면 저장된 OCR 데이터로 무료 보정됩니다.
    · 텍스트 파일도 저장: 인식한 글자를 .txt 로도 저장
 3) [OCR 시작] → 페이지 수와 예상 요금을 확인하고 [예]
 4) 결과는 원본 PDF와 같은 폴더에 저장됩니다.
@@ -384,19 +394,104 @@ def extract_lines(annotation, page_w, page_h):
     return lines
 
 
-def build_searchable_pdf(pdf_path, cache_dir, output_path, log, progress, stop):
-    doc = pymupdf.open(pdf_path)
-    font = pymupdf.Font("korea")  # PyMuPDF 내장 한글 폰트
+# ---------------------------------------------------------------- 기울기 보정
 
-    for page in doc:
+def measure_skew(annotation):
+    """단어 상자 윗변 기울기의 중간값(도). 이미지 좌표는 y가 아래로 커지므로 양수면 오른쪽이 내려간 것."""
+    angles = []
+    for page in annotation.get("pages", []):
+        for block in page.get("blocks", []):
+            for paragraph in block.get("paragraphs", []):
+                for word in paragraph.get("words", []):
+                    verts = word.get("boundingBox", {}).get("vertices", [])
+                    if len(verts) < 2 or len(word.get("symbols", [])) < 3:
+                        continue
+                    dx = verts[1].get("x", 0) - verts[0].get("x", 0)
+                    dy = verts[1].get("y", 0) - verts[0].get("y", 0)
+                    if dx > 20:  # 짧은 단어나 세로로 놓인 글자는 각도가 부정확해서 뺀다
+                        angles.append(math.degrees(math.atan2(dy, dx)))
+    return statistics.median(angles) if len(angles) >= 5 else 0.0
+
+
+def rotate_annotation(annotation, degrees):
+    """이미지를 degrees만큼 반시계로 돌렸을 때에 맞게 단어 좌표도 같이 돌린다."""
+    c, s = math.cos(math.radians(degrees)), math.sin(math.radians(degrees))
+    for page in annotation.get("pages", []):
+        cx, cy = page.get("width", 0) / 2, page.get("height", 0) / 2
+        for block in page.get("blocks", []):
+            for paragraph in block.get("paragraphs", []):
+                for word in paragraph.get("words", []):
+                    for v in word.get("boundingBox", {}).get("vertices", []):
+                        x, y = v.get("x", 0) - cx, v.get("y", 0) - cy
+                        v["x"], v["y"] = cx + x * c + y * s, cy - x * s + y * c
+
+
+def deskewed_page_image(page, width_px, degrees):
+    """페이지를 그려서 degrees만큼 돌린 JPEG를 만든다.
+    원본 스캔 이미지보다 높은 해상도로 그리면 용량만 커지므로, OCR 해상도와 원본 해상도 중 낮은 쪽을 쓴다."""
+    scale = width_px / page.rect.width
+    images = [info for info in page.get_image_info() if info.get("width")]
+    if images:
+        main = max(images, key=lambda info: pymupdf.Rect(info["bbox"]).get_area())
+        bbox_width = pymupdf.Rect(main["bbox"]).width
+        if bbox_width > 0:
+            scale = min(scale, main["width"] / bbox_width)
+    pix = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale))
+    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    # 흑백 스캔이면 흑백으로 저장해서 용량을 줄인다
+    r, g, b = img.resize((64, 64)).split()
+    is_gray = max(ImageChops.difference(r, g).getextrema()[1],
+                  ImageChops.difference(g, b).getextrema()[1]) <= 12
+    if is_gray:
+        img = img.convert("L")
+    img = img.rotate(degrees, resample=Image.BICUBIC, fillcolor=255 if is_gray else (255, 255, 255))
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=85)
+    return buf.getvalue()
+
+
+def deskew_page(page, annotation, out):
+    """기울어진 페이지면 똑바로 세운 이미지를 out에 새 페이지로 넣고 각도를 돌려준다. 아니면 None."""
+    width_px = (annotation.get("pages") or [{}])[0].get("width")
+    if not width_px:
+        return None
+    angle = measure_skew(annotation)
+    if not MIN_SKEW_DEGREES <= abs(angle) <= MAX_SKEW_DEGREES:
+        return None
+    jpeg = deskewed_page_image(page, width_px, angle)
+    rotate_annotation(annotation, angle)
+    new_page = out.new_page(width=page.rect.width, height=page.rect.height)
+    new_page.insert_image(new_page.rect, stream=jpeg)
+    return angle
+
+
+# ---------------------------------------------------------------- PDF 만들기
+
+def build_searchable_pdf(pdf_path, cache_dir, output_path, log, progress, stop, deskew=False):
+    src = pymupdf.open(pdf_path)
+    # 기울기 보정을 하면 페이지 이미지를 바꿔야 해서 새 문서에 페이지를 옮겨 담는다
+    out = pymupdf.open() if deskew else src
+    font = pymupdf.Font("korea")  # PyMuPDF 내장 한글 폰트
+    fixed_angles = []
+
+    for page in src:
         if stop.is_set():
             raise Cancelled()
         annotation = load_annotation(cache_dir, page.number + 1)
+        target = page
+        if deskew:
+            angle = deskew_page(page, annotation, out) if annotation else None
+            if angle is None:
+                out.insert_pdf(src, from_page=page.number, to_page=page.number)
+            else:
+                fixed_angles.append(angle)
+            target = out[-1]
+        progress(page.number + 1, src.page_count, "PDF 만들기")
         if not annotation:
             continue
-        page.insert_font(fontname="kr", fontbuffer=font.buffer)
+        target.insert_font(fontname="kr", fontbuffer=font.buffer)
 
-        for text, rect in extract_lines(annotation, page.rect.width, page.rect.height):
+        for text, rect in extract_lines(annotation, target.rect.width, target.rect.height):
             if not text or rect.is_empty or rect.width < 1:
                 continue
             fontsize = rect.height * 0.85
@@ -405,16 +500,21 @@ def build_searchable_pdf(pdf_path, cache_dir, output_path, log, progress, stop):
                 continue
             # 글자 폭을 실제 이미지 속 줄 길이에 맞게 가로로 늘이거나 줄인다
             origin = pymupdf.Point(rect.x0, rect.y1 - rect.height * 0.15)
-            page.insert_text(
+            target.insert_text(
                 origin, text, fontname="kr", fontsize=fontsize,
                 render_mode=3,  # 보이지 않는 글자 (검색/드래그만 됨)
                 morph=(origin, pymupdf.Matrix(rect.width / natural_width, 1)),
             )
-        progress(page.number + 1, doc.page_count, "PDF 만들기")
 
+    if deskew:
+        if fixed_angles:
+            log(f"기울기 보정: {len(fixed_angles)}쪽 (가장 많이 기운 페이지 "
+                f"{max(abs(a) for a in fixed_angles):.1f}°)")
+        else:
+            log("기울기 보정: 기울어진 페이지가 없습니다.")
     log("PDF 저장 중... (용량이 크면 시간이 걸립니다)")
-    doc.subset_fonts()
-    doc.save(output_path, garbage=3, deflate=True)
+    out.subset_fonts()
+    out.save(output_path, garbage=3, deflate=True)
     log(f"저장: {os.path.basename(output_path)}")
 
 
@@ -475,6 +575,7 @@ class App:
         self.split_var = tk.StringVar()
         self.skip_text_var = tk.BooleanVar(value=settings.get("skip_text", True))
         self.save_txt_var = tk.BooleanVar(value=settings.get("save_txt", False))
+        self.deskew_var = tk.BooleanVar(value=settings.get("deskew", False))
         self.show_key_var = tk.BooleanVar(value=False)
 
         notebook = ttk.Notebook(root)
@@ -550,8 +651,10 @@ class App:
         checks.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Checkbutton(checks, text="이미 글자가 있는 페이지 건너뛰기",
                         variable=self.skip_text_var).pack(side="left")
+        ttk.Checkbutton(checks, text="기울기 보정",
+                        variable=self.deskew_var).pack(side="left", padx=16)
         ttk.Checkbutton(checks, text="텍스트 파일(.txt)도 저장",
-                        variable=self.save_txt_var).pack(side="left", padx=16)
+                        variable=self.save_txt_var).pack(side="left")
 
         # 실행 버튼
         buttons = ttk.Frame(tab)
@@ -653,6 +756,7 @@ class App:
                     "dpi": self.dpi_var.get(),
                     "skip_text": self.skip_text_var.get(),
                     "save_txt": self.save_txt_var.get(),
+                    "deskew": self.deskew_var.get(),
                 }, f, ensure_ascii=False)
         except OSError:
             pass
@@ -764,9 +868,9 @@ class App:
 
         self.save_settings()
         self.run_in_background(self.ocr_job, cred, plans, dpi, self.split_var.get().strip(),
-                               self.save_txt_var.get())
+                               self.save_txt_var.get(), self.deskew_var.get())
 
-    def ocr_job(self, cred, plans, dpi, split_text, save_txt):
+    def ocr_job(self, cred, plans, dpi, split_text, save_txt, deskew):
         client = None
         for index, (pdf, plan) in enumerate(plans, 1):
             name = os.path.basename(pdf)
@@ -779,7 +883,7 @@ class App:
                 self.log_threadsafe(f"OCR {len(plan['todo'])}쪽 ({dpi}dpi)")
                 run_ocr(pdf, client, cache_dir, dpi, plan["todo"], self.progress_threadsafe, self.stop)
             build_searchable_pdf(pdf, cache_dir, output, self.log_threadsafe,
-                                 self.progress_threadsafe, self.stop)
+                                 self.progress_threadsafe, self.stop, deskew)
             if save_txt:
                 save_text(pdf, cache_dir, f"{base}(OCR).txt", self.log_threadsafe)
             if split_text:

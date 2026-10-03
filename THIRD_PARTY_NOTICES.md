@@ -5,6 +5,7 @@
 | 이름 | 버전 | 라이선스 | 프로젝트 |
 |---|---|---|---|
 | PyMuPDF / MuPDF | 1.28.2 | GNU AGPL v3 | https://github.com/pymupdf/PyMuPDF |
+| Pillow | 12.3.0 | MIT-CMU (HPND) | https://github.com/python-pillow/Pillow |
 | google-cloud-vision | 3.16.0 | Apache 2.0 | https://github.com/googleapis/google-cloud-python |
 | google-api-core | 2.40.0 | Apache 2.0 | https://github.com/googleapis/python-api-core |
 | google-auth | 2.59.1 | Apache 2.0 | https://github.com/googleapis/google-auth-library-python |
