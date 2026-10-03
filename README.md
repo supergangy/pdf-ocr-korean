@@ -14,6 +14,8 @@
 
 [Releases](https://github.com/supergangy/pdf-ocr-korean/releases)에서 `PDF_OCR.exe`를 받아 실행하세요. 설치나 파이썬은 필요 없습니다.
 
+바뀐 점은 [업데이트 기록](CHANGELOG.md)에서 볼 수 있습니다.
+
 > 처음 실행할 때 윈도우 "PC 보호" 경고가 뜨면 **추가 정보 → 실행**을 누르세요.
 > 서명되지 않은 개인 프로그램이라 뜨는 경고입니다. 소스 코드는 이 저장소에서 모두 확인할 수 있습니다.
 
